@@ -1202,6 +1202,10 @@ int main(void)
 	unsigned int counter = 0;
 
 	printk("LooUQ MTC2-N9151 cellular/NTN UDP sample started\n");
+	if (strlen(CONFIG_TAGO_DEVICE_TOKEN) == 0 || strlen(CONFIG_TAGO_HASH) == 0) {
+		printk("WARNING: TagoIO token/hash not set; copy secrets.conf.example "
+		       "to secrets.conf and rebuild\n");
+	}
 	svc_pins_init();
 	modem_init();
 
