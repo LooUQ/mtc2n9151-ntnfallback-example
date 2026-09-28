@@ -7,8 +7,8 @@
 menu "UDP Sample Settings"
 
 config UDP_APN
-	string "APN used for the IP connection"
-	default "nbiot"
+	string "APN used for the IP connection (cellular and satellite)"
+	default "go.mono"
 
 config UDP_ALLOC_NEW_CID
 	bool "Allocate a new (dedicated) context identifier for the connection"
@@ -87,6 +87,53 @@ config GNSS_COEX0_CMD
 config NTN_BAND_LIST
 	string "NTN band list for AT%XBANDLOCK (comma-separated)"
 	default "23,255,256"
+
+choice LINK_TN_MODE
+	prompt "Cellular (terrestrial) access technology"
+	default LINK_TN_MODE_LTEM
+	help
+	  System mode written with AT%XSYSTEMMODE before each cellular attach.
+	  Cellular is used whenever its control pin (P0.21) is floating.
+
+config LINK_TN_MODE_LTEM
+	bool "LTE-M"
+
+config LINK_TN_MODE_NBIOT
+	bool "NB-IoT"
+
+endchoice
+
+config LINK_TN_BAND_LIST
+	string "Cellular band list for AT%XBANDLOCK (comma-separated, empty = no lock)"
+	default "2,4,12,13,66"
+	help
+	  Bands the modem may use on cellular. The default covers the Monogoto
+	  US LTE-M carriers (AT&T, T-Mobile, Verizon). Empty removes the band lock
+	  (AT%XBANDLOCK=0) so every band the modem supports is searched. The NTN
+	  band lock is re-applied on each satellite attach.
+
+config LINK_ATTACH_TIMEOUT_TN_S
+	int "Cellular attach timeout (s)"
+	default 300
+	help
+	  Abandon a cellular attach that has not registered after this long,
+	  and fall back to satellite if its control pin allows it.
+
+config LINK_ATTACH_TIMEOUT_NTN_S
+	int "Satellite attach timeout (s), 0 = wait indefinitely"
+	default 0
+	help
+	  Abandon a satellite attach that has not registered after this long,
+	  then retry. 0 waits until registration or a control-pin change.
+
+config LINK_TN_PROBE_INTERVAL_S
+	int "Satellite dwell (s) before retrying cellular after a failed attach"
+	default 900
+	help
+	  After a cellular attach fails and the device falls back to satellite,
+	  stay on satellite this long before trying cellular again. Each retry
+	  that fails restarts the interval. Grounding and releasing the cellular
+	  control pin (P0.21) retries cellular immediately.
 
 config TEST_NAME
     string "Test name to use in the payload"

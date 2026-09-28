@@ -18,6 +18,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/shell/shell.h>
 
 #include <date_time.h>
@@ -62,6 +63,7 @@ enum app_phase {
 	PHASE_GNSS_FIX,
 	PHASE_ATTACHING,
 	PHASE_CONNECTED,
+	PHASE_NO_SERVICE,
 };
 static enum app_phase app_phase;
 
@@ -69,8 +71,9 @@ static const char *phase_str(enum app_phase p)
 {
 	switch (p) {
 	case PHASE_GNSS_FIX:	return "acquiring GNSS fix";
-	case PHASE_ATTACHING:	return "attaching to NTN";
+	case PHASE_ATTACHING:	return "attaching";
 	case PHASE_CONNECTED:	return "connected";
+	case PHASE_NO_SERVICE:	return "no service (both networks grounded)";
 	default:		return "init";
 	}
 }
@@ -96,6 +99,105 @@ static unsigned int good_recvs;
 /* log_tally() reads the time, but read_unix_time() is defined later with the
  * other modem helpers. */
 static int64_t read_unix_time(void);
+
+/* Network service control inputs, from the zephyr,user node in the board
+ * overlay (P0.21 cellular, P0.22 satellite). Active-low with the internal
+ * pull-up: a floating pin leaves the network available, a pin grounded forces
+ * it out of service. A property missing from the devicetree leaves that network
+ * always available. Polled, not interrupt-driven.
+ *
+ * Cellular has priority: with both pins floating the device uses cellular.
+ */
+enum svc_net {
+	SVC_TN,		/* terrestrial cellular */
+	SVC_NTN,	/* satellite */
+	SVC_COUNT,
+	SVC_NONE = SVC_COUNT,
+};
+
+#define ZEPHYR_USER DT_PATH(zephyr_user)
+
+static const struct gpio_dt_spec svc_disable_pin[SVC_COUNT] = {
+	[SVC_TN]  = GPIO_DT_SPEC_GET_OR(ZEPHYR_USER, tn_disable_gpios, {0}),
+	[SVC_NTN] = GPIO_DT_SPEC_GET_OR(ZEPHYR_USER, ntn_disable_gpios, {0}),
+};
+static const char *const svc_name[SVC_COUNT + 1] = { "Cellular", "Satellite", "none" };
+static bool svc_pin_ready[SVC_COUNT];
+static bool svc_was_disabled[SVC_COUNT];
+
+/* true if the control pin currently forces this network out of service. Logs
+ * each change, so a capture shows which outages were forced by the pin.
+ */
+static bool svc_disabled(enum svc_net net)
+{
+	bool disabled = svc_pin_ready[net] &&
+			gpio_pin_get_dt(&svc_disable_pin[net]) == 1;
+
+	if (disabled != svc_was_disabled[net]) {
+		printk("%s control pin %s: network %s\n", svc_name[net],
+		       disabled ? "GROUNDED" : "released",
+		       disabled ? "OUT OF SERVICE" : "available");
+		svc_was_disabled[net] = disabled;
+	}
+	return disabled;
+}
+
+/* Configure the control pins as pulled-up inputs and log their initial state. */
+static void svc_pins_init(void)
+{
+	for (int i = 0; i < SVC_COUNT; i++) {
+		const struct gpio_dt_spec *pin = &svc_disable_pin[i];
+
+		if (!pin->port) {
+			continue;
+		}
+		if (!gpio_is_ready_dt(pin) ||
+		    gpio_pin_configure_dt(pin, GPIO_INPUT) != 0) {
+			printk("%s control pin unavailable\n", svc_name[i]);
+			continue;
+		}
+		svc_pin_ready[i] = true;
+		printk("%s control pin %u configured\n", svc_name[i], pin->pin);
+		(void)svc_disabled(i);
+	}
+}
+
+/* Network the modem is currently attached to (SVC_NONE while detached). */
+static enum svc_net link_net = SVC_NONE;
+
+/* Set when a cellular attach fails and the device falls back to satellite.
+ * Cellular is retried CONFIG_LINK_TN_PROBE_INTERVAL_S after tn_fail_uptime.
+ */
+static bool tn_fallback;
+static int64_t tn_fail_uptime;
+
+/* Pick the network to use from the control pins. Cellular wins when its pin
+ * floats, unless it just failed to attach and satellite is available, in which
+ * case satellite is used until the retry interval elapses.
+ */
+static enum svc_net link_choose(void)
+{
+	bool tn_ok = !svc_disabled(SVC_TN);
+	bool ntn_ok = !svc_disabled(SVC_NTN);
+
+	if (!tn_ok) {
+		/* Releasing the pin again retries cellular straight away. */
+		tn_fallback = false;
+	}
+
+	if (tn_ok && tn_fallback && ntn_ok &&
+	    (k_uptime_get() - tn_fail_uptime) <
+		    (int64_t)CONFIG_LINK_TN_PROBE_INTERVAL_S * 1000) {
+		return SVC_NTN;
+	}
+	if (tn_ok) {
+		return SVC_TN;
+	}
+	if (ntn_ok) {
+		return SVC_NTN;
+	}
+	return SVC_NONE;
+}
 
 /* Advance past any characters that cannot start a number (quotes, commas,
  * spaces), so the CONFIG_NTN_LOCATION string can be tokenized with strtod
@@ -390,11 +492,6 @@ static void modem_connect(void)
 		printk("Connecting to LTE network failed, error: %d\n", err);
 		return;
 	}
-}
-
-static void modem_power_off(void)
-{
-	lte_lc_power_off();
 }
 
 static int udp_pdn_setup(void)
@@ -811,6 +908,8 @@ static void log_location(void)
 	       location_is_fixed ? "fixed (CONFIG_NTN_LOCATION)" :
 				   "dynamic (internal GNSS)");
 	printk("Phase: %s\n", phase_str(app_phase));
+	printk("Network: %s%s\n", svc_name[link_net],
+	       tn_fallback ? " (cellular attach failed; satellite fallback)" : "");
 	printk("Position: lat %.6f, lon %.6f, alt %.1f m\n",
 	       loc_lat, loc_lon, (double)loc_alt);
 
@@ -887,21 +986,71 @@ SHELL_STATIC_SUBCMD_SET_CREATE(gnss_subcmds,
 );
 SHELL_CMD_REGISTER(gnss, &gnss_subcmds, "GNSS/location commands", NULL);
 
-/* Switch the modem to NTN NB-IoT and bring up the UDP link with loc_lat/lon/alt
- * as the seeded position: CFUN=0 -> NTN system mode -> band lock -> set location
- * -> connect -> PDN + socket. Re-run on every (re)attach. Returns 0 on success,
- * -1 on failure.
+/* Wait before retrying after an attach fails outright (rather than being
+ * abandoned for a control-pin change), so a persistent error does not spin.
  */
-static int attach_ntn(void)
+#define LINK_RETRY_DELAY_S	30
+
+/* attach_link() result: abandoned because the pins now select another network. */
+#define LINK_ATTACH_PREEMPTED	1
+
+/* Cellular: select the configured terrestrial system mode (GNSS enabled
+ * alongside, as it coexists with terrestrial access) and replace the NTN band
+ * lock left by a satellite attach. Called at CFUN=0. Returns 0 or -1.
+ */
+static int prepare_tn(void)
 {
-	int err, cid, pdn_id;
+	const char *sysmode = IS_ENABLED(CONFIG_LINK_TN_MODE_NBIOT) ? "0,1,1,0" :
+								      "1,0,1,0";
+	int err;
 
-	app_phase = PHASE_ATTACHING;
+	err = nrf_modem_at_printf("AT%%XSYSTEMMODE=%s", sysmode);
+	if (err) {
+		printk("Set cellular system mode failed, type: %d, error: %d\n",
+		       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
+		return -1;
+	}
 
-	/* System mode can only change at CFUN=0. Switch to NTN NB-IoT (all other
-	 * systems must be 0 for the 5th parameter to enable NTN).
-	 */
-	(void)nrf_modem_at_printf("AT+CFUN=0");
+	if (strlen(CONFIG_LINK_TN_BAND_LIST) > 0) {
+		err = nrf_modem_at_printf("AT%%XBANDLOCK=2,,\"%s\"",
+					  CONFIG_LINK_TN_BAND_LIST);
+	} else {
+		err = nrf_modem_at_printf("AT%%XBANDLOCK=0");
+	}
+	if (err) {
+		printk("Cellular band lock failed, type: %d, error: %d\n",
+		       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
+		return -1;
+	}
+	printk("Cellular %s, bands: %s\n",
+	       IS_ENABLED(CONFIG_LINK_TN_MODE_NBIOT) ? "NB-IoT" : "LTE-M",
+	       strlen(CONFIG_LINK_TN_BAND_LIST) > 0 ? CONFIG_LINK_TN_BAND_LIST : "all");
+
+	return 0;
+}
+
+/* Satellite: make sure there is a usable position (dynamic mode acquires one
+ * from GNSS if there is none yet or it has outlived its validity), then select
+ * NTN NB-IoT, lock the NTN bands and seed the position so satellite acquisition
+ * can start. Called at CFUN=0. Returns 0 or -1.
+ */
+static int prepare_ntn(void)
+{
+	int err;
+
+	if (!location_is_fixed &&
+	    (last_fix_uptime == 0 ||
+	     (CONFIG_NTN_LOCATION_VALIDITY_S > 0 &&
+	      (k_uptime_get() - last_fix_uptime) >
+		      (int64_t)CONFIG_NTN_LOCATION_VALIDITY_S * 1000))) {
+		if (acquire_gnss_location() != 0) {
+			printk("GNSS acquisition failed\n");
+			return -1;
+		}
+		app_phase = PHASE_ATTACHING;
+	}
+
+	/* All other systems must be 0 for the 5th parameter to enable NTN. */
 	err = nrf_modem_at_printf("AT%%XSYSTEMMODE=0,0,0,0,1");
 	if (err) {
 		printk("Set NTN system mode failed, type: %d, error: %d\n",
@@ -921,9 +1070,51 @@ static int attach_ntn(void)
 	}
 	printk("Locked to NTN bands %s\n", CONFIG_NTN_BAND_LIST);
 
-	/* Seed the position before connecting so satellite acquisition can start. */
-	if (set_modem_location(loc_lat, loc_lon, loc_alt,
-			       CONFIG_NTN_LOCATION_VALIDITY_S) != 0) {
+	return set_modem_location(loc_lat, loc_lon, loc_alt,
+				  CONFIG_NTN_LOCATION_VALIDITY_S) == 0 ? 0 : -1;
+}
+
+/* Wait for registration on net, checking the control pins every second so a
+ * pin change abandons the attach at once. timeout_s 0 waits indefinitely.
+ * Returns 0 when registered, LINK_ATTACH_PREEMPTED if the pins now select
+ * another network, -1 on timeout.
+ */
+static int wait_registered(enum svc_net net, int timeout_s)
+{
+	int64_t start = k_uptime_get();
+
+	while (k_sem_take(&lte_connected, K_SECONDS(1)) != 0) {
+		if (link_choose() != net) {
+			printk("%s attach abandoned: control pins changed\n",
+			       svc_name[net]);
+			return LINK_ATTACH_PREEMPTED;
+		}
+		if (timeout_s > 0 &&
+		    (k_uptime_get() - start) > (int64_t)timeout_s * 1000) {
+			printk("%s attach timed out after %d s\n", svc_name[net],
+			       timeout_s);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* Bring up the UDP link on net: CFUN=0 -> system mode + band lock (+ position
+ * for satellite) -> connect -> PDN + socket. Returns 0 on success,
+ * LINK_ATTACH_PREEMPTED if abandoned for a control-pin change, -1 on failure.
+ * The modem is left at CFUN=0 on any failure.
+ */
+static int attach_link(enum svc_net net)
+{
+	int err, cid, pdn_id;
+
+	printk("Attaching to %s\n", svc_name[net]);
+	app_phase = PHASE_ATTACHING;
+	refix_requested = false;
+
+	/* System mode and band lock can only change at CFUN=0. */
+	(void)nrf_modem_at_printf("AT+CFUN=0");
+	if ((net == SVC_TN ? prepare_tn() : prepare_ntn()) != 0) {
 		return -1;
 	}
 
@@ -934,43 +1125,89 @@ static int attach_ntn(void)
 
 	k_sem_reset(&lte_connected);
 	modem_connect();
-	k_sem_take(&lte_connected, K_FOREVER);
+	err = wait_registered(net, net == SVC_TN ? CONFIG_LINK_ATTACH_TIMEOUT_TN_S :
+						   CONFIG_LINK_ATTACH_TIMEOUT_NTN_S);
+	if (err) {
+		lte_lc_power_off();	/* stop searching */
+		return err;
+	}
 
 	log_signal_quality();
 	log_modem_status();
 
 	pdn_id = udp_pdn_activate(cid);
-	if (pdn_id == -1) {
+	if (pdn_id != -1) {
+		udp_fd = udp_socket_setup(pdn_id);
+	}
+	if (pdn_id == -1 || udp_fd == -1) {
+		udp_fd = -1;
+		lte_lc_power_off();
 		return -1;
 	}
 
-	udp_fd = udp_socket_setup(pdn_id);
-	if (udp_fd == -1) {
-		return -1;
-	}
-
+	link_net = net;
 	app_phase = PHASE_CONNECTED;
+	printk("%s link up\n", svc_name[net]);
 	return 0;
 }
 
-/* Tear down the NTN link (close socket, power off LTE) so the GNSS system mode
- * can be selected for a fresh fix.
+/* Tear down the current link (close socket, modem to CFUN=0) before switching
+ * networks or acquiring a fresh GNSS fix.
  */
-static void detach_ntn(void)
+static void detach_link(void)
 {
 	if (udp_fd >= 0) {
 		udp_socket_close(udp_fd);
 		udp_fd = -1;
 	}
 	lte_lc_power_off();
+	if (link_net != SVC_NONE) {
+		printk("%s link down\n", svc_name[link_net]);
+	}
+	link_net = SVC_NONE;
+}
+
+/* Detach from whatever is up and attach to want (SVC_NONE leaves the radio
+ * off). A failed cellular attach starts the satellite fallback. Returns the
+ * attach_link() result.
+ */
+static int link_switch(enum svc_net want)
+{
+	int err;
+
+	detach_link();
+	if (want == SVC_NONE) {
+		printk("Both networks grounded by control pins; radio off\n");
+		app_phase = PHASE_NO_SERVICE;
+		return 0;
+	}
+
+	err = attach_link(want);
+	if (want == SVC_TN) {
+		tn_fallback = (err == -1);
+		if (tn_fallback) {
+			tn_fail_uptime = k_uptime_get();
+			if (!svc_disabled(SVC_NTN)) {
+				printk("Cellular attach failed; using satellite, "
+				       "cellular retry in %d s\n",
+				       CONFIG_LINK_TN_PROBE_INTERVAL_S);
+			}
+		}
+	}
+	return err;
 }
 
 int main(void)
 {
-	printk("LooUQ MTC2-N9151 NTN/UDP sample started\n");
+	unsigned int counter = 0;
+
+	printk("LooUQ MTC2-N9151 cellular/NTN UDP sample started\n");
+	svc_pins_init();
 	modem_init();
 
-	/* CONFIG_NTN_LOCATION set -> fixed position; empty -> acquire from GNSS. */
+	/* CONFIG_NTN_LOCATION set -> fixed position; empty -> acquire from GNSS
+	 * before the first satellite attach.
+	 */
 	location_is_fixed =
 		(parse_location(CONFIG_NTN_LOCATION, &loc_lat, &loc_lon, &loc_alt) == 0);
 
@@ -979,27 +1216,48 @@ int main(void)
 		       "lat %.6f, lon %.6f, alt %.1f m\n",
 		       loc_lat, loc_lon, (double)loc_alt);
 	} else {
-		printk("CONFIG_NTN_LOCATION empty; acquiring location from internal GNSS\n");
-		if (acquire_gnss_location() != 0) {
-			printk("GNSS acquisition failed; aborting\n");
-			goto power_off;
-		}
-	}
-
-	if (attach_ntn() != 0) {
-		goto power_off;
+		printk("CONFIG_NTN_LOCATION empty; satellite position comes from internal GNSS\n");
 	}
 
 	/* Send a freshly rendered CONFIG_TEST_TEMPLATE payload every
-	 * CONFIG_TEST_INTERVAL seconds. The socket stays open between sends, so
-	 * "udp send <text>" remains available for manual messages.
+	 * CONFIG_TEST_INTERVAL seconds on whichever network the control pins
+	 * select. The socket stays open between sends, so "udp send <text>"
+	 * remains available for manual messages.
 	 */
 	printk("Sending every %d s. Manual send still available: udp send <text>\n",
 	       CONFIG_TEST_INTERVAL);
 
-	for (unsigned int counter = 0; ; counter++) {
+	for (;;) {
+		enum svc_net want = link_choose();
+
+		if (want == SVC_NONE) {
+			if (app_phase != PHASE_NO_SERVICE) {
+				(void)link_switch(SVC_NONE);
+			}
+			k_sleep(K_SECONDS(1));
+			continue;
+		}
+
+		if (want != link_net) {
+			int err = link_switch(want);
+
+			if (err == LINK_ATTACH_PREEMPTED) {
+				continue;
+			}
+			if (err) {
+				/* Back off before retrying; a pin change (or the
+				 * cellular fallback) cuts the wait short.
+				 */
+				for (int s = 0; s < LINK_RETRY_DELAY_S &&
+						link_choose() == want; s++) {
+					k_sleep(K_SECONDS(1));
+				}
+				continue;
+			}
+		}
+
 		char payload[256];
-		int len = render_payload(payload, sizeof(payload), counter);
+		int len = render_payload(payload, sizeof(payload), counter++);
 
 		total_cycles++;
 		if (len < 0) {
@@ -1010,25 +1268,25 @@ int main(void)
 		log_tally();
 
 		/* The modem asked for a fresh location and the cached fix is stale.
-		 * Internal GNSS cannot run while NTN is active, so drop the link,
-		 * re-acquire, and re-attach. (Dynamic mode only.)
+		 * Internal GNSS cannot run while NTN is active, so drop the link and
+		 * re-acquire; the next pass re-attaches. (Satellite, dynamic mode.)
 		 */
-		if (!location_is_fixed && refix_requested) {
+		if (link_net == SVC_NTN && !location_is_fixed && refix_requested) {
 			printk("Refreshing GNSS location on modem request\n");
 			refix_requested = false;
-			detach_ntn();
-			if (acquire_gnss_location() != 0 || attach_ntn() != 0) {
-				printk("Location refresh / re-attach failed; aborting\n");
-				goto power_off;
+			detach_link();
+			if (acquire_gnss_location() != 0) {
+				printk("GNSS acquisition failed; keeping previous position\n");
 			}
 		}
 
-		k_sleep(K_SECONDS(CONFIG_TEST_INTERVAL));
+		/* Sleep in 1 s steps so a control-pin change takes effect promptly
+		 * instead of after a full send interval.
+		 */
+		for (int s = 0; s < CONFIG_TEST_INTERVAL && link_choose() == link_net; s++) {
+			k_sleep(K_SECONDS(1));
+		}
 	}
-
-power_off:
-	modem_power_off();
-	printk("UDP sample done\n");
 
 	return 0;
 }

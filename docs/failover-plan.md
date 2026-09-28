@@ -1,6 +1,7 @@
 # Cellular ↔ Satellite Failover — Design Plan
 
-**Status:** proposed, not implemented
+**Status:** partly implemented. Pin-selected cellular/satellite switching with cellular
+priority is in `main.c` (see §7); automatic loss detection and recovery are not
 **Target:** `mtc2n9151/nrf9151/ns` (LooUQ MTC2-N9151)
 **Modem firmware:** `mfw_nrf9151-ntn_1.0.0`
 **SDK:** nRF Connect SDK v3.3.1
@@ -49,8 +50,8 @@ metric.
 ## 2. One APN, two contexts
 
 There is exactly one APN: **`go.mono`** (Monogoto), which roams onto Skylo for satellite access.
-Both `go.mono` and `skylo.ip` have been tested successfully; `prj.conf` currently carries
-`skylo.ip` only because that is what the present build happens to hold.
+Both `go.mono` and `skylo.ip` have been tested successfully on satellite; `prj.conf` sets
+`CONFIG_UDP_APN="go.mono"`, used on both networks.
 
 Profile-based switching still needs two `+CGDCONT` contexts, because the context ID is derived
 from the profile index — but both carry the same APN string. Nordic's own §9.3 example does
@@ -240,36 +241,29 @@ what makes phases 3–4 testable on a bench instead of by driving around hunting
 Both are **one-directional: they force bad, never good.** Releasing a pin only removes the
 synthetic fault; a genuinely dead link stays dead and normal detection still rules.
 
-`boards/mtc2n9151_nrf9151_ns.overlay`:
+`boards/mtc2n9151_nrf9151_ns.overlay` (**implemented**):
 
 ```dts
 / {
-	link_overrides {
-		compatible = "gpio-keys";
-		tn_bad_override: tn_bad {
-			gpios = <&gpio0 13 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-			label = "Force cellular bad";
-		};
-		ntn_bad_override: ntn_bad {
-			gpios = <&gpio0 14 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-			label = "Force NTN bad";
-		};
+	zephyr,user {
+		tn-disable-gpios = <&gpio0 21 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		ntn-disable-gpios = <&gpio0 22 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 	};
 };
 ```
 
-P0.13 and P0.14 are unassigned in the board dtsi (P0.00–0.05, 0.07–0.10, 0.30, 0.31 are taken by
+P0.21 and P0.22 are unassigned in the board dtsi (P0.00–0.05, 0.07–0.10, 0.30, 0.31 are taken by
 I2C2/UART0/SPI1/I2C3; P0.26 is reserved for the commented-out PWM). `&gpiote` is already enabled.
 **Confirm both pins are broken out and free on your carrier before committing.** The modem's
 COEX0 (`%XCOEX0`) is a dedicated modem pin, not `gpio0`, so it does not conflict.
 
 Active-low with internal pull-up: open pin = normal, short to GND = forced bad. Fails safe if a
-wire falls off, and one 3-pin jumper block (P0.13 / P0.14 / GND) reaches every test case. Each pin
-is guarded independently with `DT_NODE_EXISTS`, so either or neither may be populated.
+wire falls off, and one 3-pin jumper block (P0.21 / P0.22 / GND) reaches every test case. Each pin
+is optional: a missing devicetree property leaves that access always available.
 
 ### Override matrix
 
-| P0.13 (TN bad) | P0.14 (NTN bad) | Behaviour |
+| P0.21 (TN bad) | P0.22 (NTN bad) | Behaviour |
 |---|---|---|
 | — | — | Normal automatic operation. |
 | asserted | — | TN evaluates bad → loss debounce → switch to NTN. Probes are failed on evaluation while asserted, so a probe cannot find real coverage and return early. |
@@ -288,6 +282,15 @@ concerns for free. GPIO from the non-secure image is fine on this `ns` target.
 
 Log every transition loudly (`Cellular-bad override ASSERTED` / `RELEASED`) so a capture is
 unambiguous about which switches were synthetic.
+
+**What is implemented today.** `main.c` picks the network from the pins, with cellular
+first: P0.21 floating → cellular; P0.21 grounded → satellite; both grounded → radio off. The
+pins are checked every second, including during an attach, so a change takes effect at once.
+A cellular attach that does not register within `LINK_ATTACH_TIMEOUT_TN_S` falls back to
+satellite and retries cellular after `LINK_TN_PROBE_INTERVAL_S`. Grounding and releasing P0.21
+retries it immediately. Mechanism A only (`CFUN=0` switches, single CID 0). Not yet
+implemented: loss detection on a registered link (§5), probe timeout, recovery hold-down,
+backoff, `NO_SERVICE` retry, and the shell overrides.
 
 ### Shell parity
 
@@ -394,4 +397,5 @@ timing*.
 5. **NVM wear.** `CFUN=0` writes NVM and `%XSYSTEMMODE` persists periodically. `CFUN=45` avoids
    most of it, but the minimum dwell timers are also a wear guard, not merely an anti-thrash
    measure. `LINK_TN_PROBE_INTERVAL_S` must not be tuned down to seconds.
-6. **P0.13 / P0.14 are broken out and unused** on the LooUQ Breakout / UXplor carrier.
+6. **P0.21 / P0.22 are broken out and unused** on the LooUQ Breakout / UXplor carrier. The board
+   devicetree does not claim either.

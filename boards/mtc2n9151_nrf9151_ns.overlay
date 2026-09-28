@@ -1,0 +1,16 @@
+/*
+ * Network service control inputs.
+ *
+ * Active-low with the internal pull-up: leave the pin floating and the network
+ * is available; ground it and that network is forced out of service. Remove a
+ * property to leave that network always available.
+ *
+ *   P0.21  grounded = cellular (TN) out of service
+ *   P0.22  grounded = satellite (NTN) out of service
+ */
+/ {
+	zephyr,user {
+		tn-disable-gpios = <&gpio0 21 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		ntn-disable-gpios = <&gpio0 22 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+	};
+};

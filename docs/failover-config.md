@@ -89,7 +89,7 @@ jumper.
 
 | Symbol | Default | What it controls |
 |---|---|---|
-| `LINK_OVERRIDE_GPIO` | `n` | Enables the override inputs: `P0.13` forces cellular bad, `P0.14` forces satellite bad. Both active-low with internal pull-ups, so an open pin is normal and a short to ground is the fault. Active level and pull live in the devicetree overlay, not here. |
+| `LINK_OVERRIDE_GPIO` | `n` | Enables the override inputs: `P0.21` forces cellular bad, `P0.22` forces satellite bad. Both active-low with internal pull-ups, so an open pin is normal and a short to ground is the fault. Active level and pull live in the devicetree overlay, not here. |
 | `LINK_OVERRIDE_PROBE_ON_RELEASE` | `y` | Releasing a pin triggers an immediate probe rather than waiting out the probe interval. Without this, testing the return path against a 900 s interval is tedious enough that people stop doing it. |
 | `LINK_OVERRIDE_SKIP_ATTACH` | `y` | An overridden radio is not attached at boot at all, rather than attached and then abandoned. Makes satellite-first cold start a one-jumper test. |
 | `LINK_NO_SERVICE_RETRY_S` | 300 | Retry cadence when both radios are unhealthy. Attempts alternate between them — retrying only the primary would mean never noticing the fallback recovered. |
