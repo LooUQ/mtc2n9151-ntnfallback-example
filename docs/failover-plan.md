@@ -1,7 +1,7 @@
 # Cellular ↔ Satellite Failover — Design Plan
 
-**Status:** partly implemented. Pin-selected cellular/satellite switching with cellular
-priority is in `main.c` (see §7); automatic loss detection and recovery are not
+**Status:** partly implemented. Cellular-first attach with timed Skylo periods and periodic
+cellular re-tests is in `main.c` (see §7); loss detection on a connected link is not
 **Target:** `mtc2n9151/nrf9151/ns` (LooUQ MTC2-N9151)
 **Modem firmware:** `mfw_nrf9151-ntn_1.0.0`
 **SDK:** nRF Connect SDK v3.3.1
@@ -283,14 +283,33 @@ concerns for free. GPIO from the non-secure image is fine on this `ns` target.
 Log every transition loudly (`Cellular-bad override ASSERTED` / `RELEASED`) so a capture is
 unambiguous about which switches were synthetic.
 
-**What is implemented today.** `main.c` picks the network from the pins, with cellular
-first: P0.21 floating → cellular; P0.21 grounded → satellite; both grounded → radio off. The
-pins are checked every second, including during an attach, so a change takes effect at once.
-A cellular attach that does not register within `LINK_ATTACH_TIMEOUT_TN_S` falls back to
-satellite and retries cellular after `LINK_TN_PROBE_INTERVAL_S`. Grounding and releasing P0.21
-retries it immediately. Mechanism A only (`CFUN=0` switches, single CID 0). Not yet
-implemented: loss detection on a registered link (§5), probe timeout, recovery hold-down,
-backoff, `NO_SERVICE` retry, and the shell overrides.
+**What is implemented today.** This differs from the design above in one deliberate way: a
+grounded pin does **not** fail fast. The access is still attempted and every timeout runs in
+full; the pin only guarantees that the attempt never counts as connected. That keeps bench
+timing identical to a real outage.
+
+The cycle in `main.c`:
+
+1. Start on cellular. Wait up to `LINK_ATTACH_TIMEOUT_TN_S` for it to connect.
+2. Connected → stay on cellular. Timed out → switch to Skylo.
+3. Stay on Skylo for `LINK_TN_PROBE_INTERVAL_S`, measured from the switch and including the
+   Skylo attach (there is no separate satellite timeout).
+4. Then drop Skylo and test cellular again, exactly as in step 1.
+
+**Loss of a connected link.** A link counts as lost while the modem is unregistered, the
+network's pin is grounded, or `LINK_FAIL_SENDS` (2) consecutive periodic sends got no reply
+(a failed send or no reply within `UDP_RECV_TIMEOUT_S`). Nothing is sent while it is lost,
+except when the loss is from unanswered sends: then sends continue at the normal interval as
+probes, and the first reply restores the link. Lost cellular gets
+`LINK_ATTACH_TIMEOUT_TN_S` to come back; if it does not, the device switches to Skylo (step 3).
+Lost Skylo is only reported, with no action: the period runs on and cellular is tested when it
+ends. Both a loss and a recovery are logged with their duration.
+
+P0.21 grounded makes every cellular test time out, and on a live cellular link it counts as a
+loss that never recovers. P0.22 grounded makes Skylo never connect, or reads as a lost Skylo
+link, for the rest of the period. Pins are checked every second. Mechanism A only (`CFUN=0`
+switches, single CID 0). Not yet implemented: probe timeout, recovery hold-down, backoff, and
+the shell overrides.
 
 ### Shell parity
 

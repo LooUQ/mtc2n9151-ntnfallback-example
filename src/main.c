@@ -63,7 +63,6 @@ enum app_phase {
 	PHASE_GNSS_FIX,
 	PHASE_ATTACHING,
 	PHASE_CONNECTED,
-	PHASE_NO_SERVICE,
 };
 static enum app_phase app_phase;
 
@@ -72,9 +71,7 @@ static const char *phase_str(enum app_phase p)
 	switch (p) {
 	case PHASE_GNSS_FIX:	return "acquiring GNSS fix";
 	case PHASE_ATTACHING:	return "attaching";
-	case PHASE_CONNECTED:	return "connected";
-	case PHASE_NO_SERVICE:	return "no service (both networks grounded)";
-	default:		return "init";
+	case PHASE_CONNECTED:	return "connected";	default:		return "init";
 	}
 }
 
@@ -100,13 +97,13 @@ static unsigned int good_recvs;
  * other modem helpers. */
 static int64_t read_unix_time(void);
 
-/* Network service control inputs, from the zephyr,user node in the board
+/* Network failure-simulation inputs, from the zephyr,user node in the board
  * overlay (P0.21 cellular, P0.22 satellite). Active-low with the internal
- * pull-up: a floating pin leaves the network available, a pin grounded forces
- * it out of service. A property missing from the devicetree leaves that network
- * always available. Polled, not interrupt-driven.
- *
- * Cellular has priority: with both pins floating the device uses cellular.
+ * pull-up: a floating pin leaves the network to behave normally; a grounded pin
+ * makes that network never count as connected. The radio still searches and
+ * every timeout still runs in full, so the pin simulates a coverage failure
+ * without changing the timing. A property missing from the devicetree leaves
+ * that network unaffected. Polled, not interrupt-driven.
  */
 enum svc_net {
 	SVC_TN,		/* terrestrial cellular */
@@ -125,8 +122,8 @@ static const char *const svc_name[SVC_COUNT + 1] = { "Cellular", "Satellite", "n
 static bool svc_pin_ready[SVC_COUNT];
 static bool svc_was_disabled[SVC_COUNT];
 
-/* true if the control pin currently forces this network out of service. Logs
- * each change, so a capture shows which outages were forced by the pin.
+/* true if the control pin currently forces this network to fail. Logs each
+ * change, so a capture shows which failures were forced by the pin.
  */
 static bool svc_disabled(enum svc_net net)
 {
@@ -134,9 +131,9 @@ static bool svc_disabled(enum svc_net net)
 			gpio_pin_get_dt(&svc_disable_pin[net]) == 1;
 
 	if (disabled != svc_was_disabled[net]) {
-		printk("%s control pin %s: network %s\n", svc_name[net],
+		printk("%s control pin %s: %s\n", svc_name[net],
 		       disabled ? "GROUNDED" : "released",
-		       disabled ? "OUT OF SERVICE" : "available");
+		       disabled ? "connection forced to fail" : "normal operation");
 		svc_was_disabled[net] = disabled;
 	}
 	return disabled;
@@ -162,42 +159,28 @@ static void svc_pins_init(void)
 	}
 }
 
-/* Network the modem is currently attached to (SVC_NONE while detached). */
+/* Network the modem is currently connected on (SVC_NONE while detached). */
 static enum svc_net link_net = SVC_NONE;
 
-/* Set when a cellular attach fails and the device falls back to satellite.
- * Cellular is retried CONFIG_LINK_TN_PROBE_INTERVAL_S after tn_fail_uptime.
+/* Network the device is using or trying: cellular first; satellite after a
+ * cellular test fails, until ntn_until (uptime ms), when cellular is tested again.
  */
-static bool tn_fallback;
-static int64_t tn_fail_uptime;
+static enum svc_net link_mode = SVC_TN;
+static int64_t ntn_until;
 
-/* Pick the network to use from the control pins. Cellular wins when its pin
- * floats, unless it just failed to attach and satellite is available, in which
- * case satellite is used until the retry interval elapses.
+/* Set from lte_handler(): true while the modem reports it is registered. */
+static volatile bool lte_registered;
+
+/* Loss of the live link: set, with the uptime (ms) it started, while the link
+ * is up but unregistered or its control pin is grounded.
  */
-static enum svc_net link_choose(void)
-{
-	bool tn_ok = !svc_disabled(SVC_TN);
-	bool ntn_ok = !svc_disabled(SVC_NTN);
+static bool link_lost;
+static int64_t lost_at;
 
-	if (!tn_ok) {
-		/* Releasing the pin again retries cellular straight away. */
-		tn_fallback = false;
-	}
-
-	if (tn_ok && tn_fallback && ntn_ok &&
-	    (k_uptime_get() - tn_fail_uptime) <
-		    (int64_t)CONFIG_LINK_TN_PROBE_INTERVAL_S * 1000) {
-		return SVC_NTN;
-	}
-	if (tn_ok) {
-		return SVC_TN;
-	}
-	if (ntn_ok) {
-		return SVC_NTN;
-	}
-	return SVC_NONE;
-}
+/* Consecutive periodic send cycles on the live link that got no reply. At
+ * CONFIG_LINK_FAIL_SENDS the link counts as lost.
+ */
+static unsigned int fail_sends;
 
 /* Advance past any characters that cannot start a number (quotes, commas,
  * spaces), so the CONFIG_NTN_LOCATION string can be tokenized with strtod
@@ -311,12 +294,14 @@ static void lte_handler(const struct lte_lc_evt *const evt)
 			}
 			printk("Network registration status: %d (%s)\n",
 			       evt->nw_reg_status, reason);
+			lte_registered = false;
 			break;
 		}
 
 		printk("Network registration status: %s\n",
 		       evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME ?
 		       "Connected - home network" : "Connected - roaming");
+		lte_registered = true;
 		k_sem_give(&lte_connected);
 		break;
 	case LTE_LC_EVT_RRC_UPDATE:
@@ -628,7 +613,11 @@ error_close_socket:
 	return -1;
 }
 
-static void udp_send_and_recv(int fd, const void *payload, size_t payload_len)
+/* Send payload and wait for the server's reply. Returns true only if a reply
+ * was received; a failed send or no reply counts as a failed cycle for
+ * CONFIG_LINK_FAIL_SENDS.
+ */
+static bool udp_send_and_recv(int fd, const void *payload, size_t payload_len)
 {
 	char buffer[256];
 	ssize_t len;
@@ -640,7 +629,7 @@ static void udp_send_and_recv(int fd, const void *payload, size_t payload_len)
 		       (const char *)payload);
 	} else {
 		printk("Send failed, error: %d, errno: %d\n", len, errno);
-		return;
+		return false;
 	}
 
 	/* Give the reply time to arrive before listening for it. On high-latency
@@ -656,14 +645,16 @@ static void udp_send_and_recv(int fd, const void *payload, size_t payload_len)
 		good_recvs++;
 		buffer[len] = '\0';
 		printk("Received %d bytes: %s\n", len, buffer);
-	} else if (len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-		/* recv timed out (SO_RCVTIMEO) with no reply - normal for UDP over
-		 * a high-latency satellite link, not a failure.
-		 */
+		return true;
+	}
+
+	if (len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+		/* recv timed out (SO_RCVTIMEO) with no reply. */
 		printk("** No reply within recv timeout: %ds\n", CONFIG_UDP_RECV_TIMEOUT_S);
 	} else if (len < 0) {
 		printk("Receive failed, error: %d, errno: %d\n", len, errno);
 	}
+	return false;
 }
 
 /* Print the running send/receive tallies, prefixed with the current time as
@@ -908,8 +899,12 @@ static void log_location(void)
 	       location_is_fixed ? "fixed (CONFIG_NTN_LOCATION)" :
 				   "dynamic (internal GNSS)");
 	printk("Phase: %s\n", phase_str(app_phase));
-	printk("Network: %s%s\n", svc_name[link_net],
-	       tn_fallback ? " (cellular attach failed; satellite fallback)" : "");
+	printk("Network: %s (using %s)\n", svc_name[link_net], svc_name[link_mode]);
+	if (link_mode == SVC_NTN) {
+		int64_t left_ms = ntn_until - k_uptime_get();
+
+		printk("Next cellular test in %lld s\n", left_ms > 0 ? left_ms / 1000 : 0);
+	}
 	printk("Position: lat %.6f, lon %.6f, alt %.1f m\n",
 	       loc_lat, loc_lon, (double)loc_alt);
 
@@ -986,22 +981,24 @@ SHELL_STATIC_SUBCMD_SET_CREATE(gnss_subcmds,
 );
 SHELL_CMD_REGISTER(gnss, &gnss_subcmds, "GNSS/location commands", NULL);
 
-/* Wait before retrying after an attach fails outright (rather than being
- * abandoned for a control-pin change), so a persistent error does not spin.
+/* Wait before retrying a satellite attach that failed early in the satellite
+ * period (an AT error, say), so a persistent error does not spin.
  */
 #define LINK_RETRY_DELAY_S	30
 
-/* attach_link() result: abandoned because the pins now select another network. */
-#define LINK_ATTACH_PREEMPTED	1
-
 /* Cellular: select the configured terrestrial system mode (GNSS enabled
  * alongside, as it coexists with terrestrial access) and replace the NTN band
- * lock left by a satellite attach. Called at CFUN=0. Returns 0 or -1.
+ * lock left by a satellite attach. The band lock must follow the system mode
+ * change: in NTN mode the modem rejects terrestrial bands. A rejected band list
+ * is not fatal; the lock is cleared so every band is searched instead. Fails
+ * only if the NTN lock cannot be cleared, since cellular could not register
+ * with it in place. Called at CFUN=0. Returns 0 or -1.
  */
 static int prepare_tn(void)
 {
 	const char *sysmode = IS_ENABLED(CONFIG_LINK_TN_MODE_NBIOT) ? "0,1,1,0" :
 								      "1,0,1,0";
+	bool locked = false;
 	int err;
 
 	err = nrf_modem_at_printf("AT%%XSYSTEMMODE=%s", sysmode);
@@ -1014,17 +1011,26 @@ static int prepare_tn(void)
 	if (strlen(CONFIG_LINK_TN_BAND_LIST) > 0) {
 		err = nrf_modem_at_printf("AT%%XBANDLOCK=2,,\"%s\"",
 					  CONFIG_LINK_TN_BAND_LIST);
-	} else {
-		err = nrf_modem_at_printf("AT%%XBANDLOCK=0");
+		if (err) {
+			printk("WARNING: cellular band lock \"%s\" rejected, type: %d, "
+			       "error: %d; searching all bands\n",
+			       CONFIG_LINK_TN_BAND_LIST,
+			       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
+		} else {
+			locked = true;
+		}
 	}
-	if (err) {
-		printk("Cellular band lock failed, type: %d, error: %d\n",
-		       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
-		return -1;
+	if (!locked) {
+		err = nrf_modem_at_printf("AT%%XBANDLOCK=0");
+		if (err) {
+			printk("Clear band lock failed, type: %d, error: %d\n",
+			       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
+			return -1;
+		}
 	}
 	printk("Cellular %s, bands: %s\n",
 	       IS_ENABLED(CONFIG_LINK_TN_MODE_NBIOT) ? "NB-IoT" : "LTE-M",
-	       strlen(CONFIG_LINK_TN_BAND_LIST) > 0 ? CONFIG_LINK_TN_BAND_LIST : "all");
+	       locked ? CONFIG_LINK_TN_BAND_LIST : "all");
 
 	return 0;
 }
@@ -1074,39 +1080,43 @@ static int prepare_ntn(void)
 				  CONFIG_NTN_LOCATION_VALIDITY_S) == 0 ? 0 : -1;
 }
 
-/* Wait for registration on net, checking the control pins every second so a
- * pin change abandons the attach at once. timeout_s 0 waits indefinitely.
- * Returns 0 when registered, LINK_ATTACH_PREEMPTED if the pins now select
- * another network, -1 on timeout.
+/* Wait until the modem is registered on net, or until deadline (uptime ms).
+ * While net's control pin is grounded a registration is ignored, so the wait
+ * runs to the deadline: the pin forces a failure without shortening the
+ * timing. Returns 0 when registered, -1 at the deadline.
  */
-static int wait_registered(enum svc_net net, int timeout_s)
+static int wait_registered(enum svc_net net, int64_t deadline)
 {
-	int64_t start = k_uptime_get();
+	bool ignored = false;
 
-	while (k_sem_take(&lte_connected, K_SECONDS(1)) != 0) {
-		if (link_choose() != net) {
-			printk("%s attach abandoned: control pins changed\n",
-			       svc_name[net]);
-			return LINK_ATTACH_PREEMPTED;
+	for (;;) {
+		(void)k_sem_take(&lte_connected, K_SECONDS(1));
+
+		if (lte_registered) {
+			if (!svc_disabled(net)) {
+				return 0;
+			}
+			if (!ignored) {
+				printk("%s registered, but control pin grounded: ignoring\n",
+				       svc_name[net]);
+				ignored = true;
+			}
 		}
-		if (timeout_s > 0 &&
-		    (k_uptime_get() - start) > (int64_t)timeout_s * 1000) {
-			printk("%s attach timed out after %d s\n", svc_name[net],
-			       timeout_s);
+		if (k_uptime_get() >= deadline) {
+			printk("%s attach timed out\n", svc_name[net]);
 			return -1;
 		}
 	}
-	return 0;
 }
 
 /* Bring up the UDP link on net: CFUN=0 -> system mode + band lock (+ position
- * for satellite) -> connect -> PDN + socket. Returns 0 on success,
- * LINK_ATTACH_PREEMPTED if abandoned for a control-pin change, -1 on failure.
- * The modem is left at CFUN=0 on any failure.
+ * for satellite) -> connect -> PDN + socket, waiting for registration until
+ * deadline (uptime ms). Returns 0 on success, -1 on failure. The modem is left
+ * at CFUN=0 on failure.
  */
-static int attach_link(enum svc_net net)
+static int attach_link(enum svc_net net, int64_t deadline)
 {
-	int err, cid, pdn_id;
+	int cid, pdn_id;
 
 	printk("Attaching to %s\n", svc_name[net]);
 	app_phase = PHASE_ATTACHING;
@@ -1123,13 +1133,12 @@ static int attach_link(enum svc_net net)
 		return -1;
 	}
 
+	lte_registered = false;
 	k_sem_reset(&lte_connected);
 	modem_connect();
-	err = wait_registered(net, net == SVC_TN ? CONFIG_LINK_ATTACH_TIMEOUT_TN_S :
-						   CONFIG_LINK_ATTACH_TIMEOUT_NTN_S);
-	if (err) {
+	if (wait_registered(net, deadline) != 0) {
 		lte_lc_power_off();	/* stop searching */
-		return err;
+		return -1;
 	}
 
 	log_signal_quality();
@@ -1165,36 +1174,95 @@ static void detach_link(void)
 		printk("%s link down\n", svc_name[link_net]);
 	}
 	link_net = SVC_NONE;
+	link_lost = false;
+	fail_sends = 0;
 }
 
-/* Detach from whatever is up and attach to want (SVC_NONE leaves the radio
- * off). A failed cellular attach starts the satellite fallback. Returns the
- * attach_link() result.
+/* Switch to satellite for CONFIG_LINK_TN_PROBE_INTERVAL_S, after which
+ * cellular is tested again.
  */
-static int link_switch(enum svc_net want)
+static void start_ntn_period(void)
 {
-	int err;
+	link_mode = SVC_NTN;
+	ntn_until = k_uptime_get() + (int64_t)CONFIG_LINK_TN_PROBE_INTERVAL_S * 1000;
+	printk("Using satellite for %d s before the next cellular test\n",
+	       CONFIG_LINK_TN_PROBE_INTERVAL_S);
+}
 
-	detach_link();
-	if (want == SVC_NONE) {
-		printk("Both networks grounded by control pins; radio off\n");
-		app_phase = PHASE_NO_SERVICE;
-		return 0;
+/* true once the satellite period is over and cellular is due for a test. */
+static bool ntn_period_over(void)
+{
+	return link_mode == SVC_NTN && k_uptime_get() >= ntn_until;
+}
+
+/* true when CONFIG_LINK_FAIL_SENDS consecutive send cycles got no reply. */
+static bool sends_failing(void)
+{
+	return CONFIG_LINK_FAIL_SENDS > 0 && fail_sends >= CONFIG_LINK_FAIL_SENDS;
+}
+
+/* Check the live link and return true if it is usable. The link is lost while
+ * the modem is unregistered, the network's control pin is grounded, or
+ * CONFIG_LINK_FAIL_SENDS consecutive sends got no reply. A lost cellular link
+ * gets CONFIG_LINK_ATTACH_TIMEOUT_TN_S to come back before the device switches
+ * to satellite. A lost satellite link is only reported; the satellite period
+ * runs on and cellular is tested when it ends.
+ */
+static bool link_check(void)
+{
+	int64_t now = k_uptime_get();
+	const char *why;
+	bool pin;
+
+	if (link_net == SVC_NONE) {
+		return false;
 	}
 
-	err = attach_link(want);
-	if (want == SVC_TN) {
-		tn_fallback = (err == -1);
-		if (tn_fallback) {
-			tn_fail_uptime = k_uptime_get();
-			if (!svc_disabled(SVC_NTN)) {
-				printk("Cellular attach failed; using satellite, "
-				       "cellular retry in %d s\n",
-				       CONFIG_LINK_TN_PROBE_INTERVAL_S);
-			}
+	pin = svc_disabled(link_net);
+	if (lte_registered && !pin && !sends_failing()) {
+		if (link_lost) {
+			printk("%s connection restored after %lld s\n",
+			       svc_name[link_net], (now - lost_at) / 1000);
+			link_lost = false;
 		}
+		return true;
 	}
-	return err;
+
+	if (!link_lost) {
+		link_lost = true;
+		lost_at = now;
+		why = pin ? "control pin grounded" :
+		      !lte_registered ? "not registered" : "no reply to consecutive sends";
+		if (link_net == SVC_TN) {
+			printk("Cellular connection lost (%s); waiting up to %d s for it "
+			       "to return\n", why, CONFIG_LINK_ATTACH_TIMEOUT_TN_S);
+		} else {
+			printk("Satellite connection lost (%s); reported only, "
+			       "cellular test in %lld s\n", why, (ntn_until - now) / 1000);
+		}
+		return false;
+	}
+
+	if (link_net == SVC_TN &&
+	    (now - lost_at) >= (int64_t)CONFIG_LINK_ATTACH_TIMEOUT_TN_S * 1000) {
+		printk("Cellular did not return within %d s\n",
+		       CONFIG_LINK_ATTACH_TIMEOUT_TN_S);
+		detach_link();
+		start_ntn_period();
+	}
+	return false;
+}
+
+/* true when a payload should be sent: the link is usable, or it is lost only
+ * because sends got no reply. The modem is still registered then, so a reply
+ * to the next send is the only way to see the link recover.
+ */
+static bool link_sendable(void)
+{
+	if (link_check()) {
+		return true;
+	}
+	return link_net != SVC_NONE && lte_registered && !svc_disabled(link_net);
 }
 
 int main(void)
@@ -1223,41 +1291,52 @@ int main(void)
 		printk("CONFIG_NTN_LOCATION empty; satellite position comes from internal GNSS\n");
 	}
 
-	/* Send a freshly rendered CONFIG_TEST_TEMPLATE payload every
-	 * CONFIG_TEST_INTERVAL seconds on whichever network the control pins
-	 * select. The socket stays open between sends, so "udp send <text>"
-	 * remains available for manual messages.
+	/* Cellular first. If it does not connect within
+	 * CONFIG_LINK_ATTACH_TIMEOUT_TN_S, use satellite for
+	 * CONFIG_LINK_TN_PROBE_INTERVAL_S, then drop satellite and test cellular
+	 * again. A connected cellular link is kept; if it is lost it gets
+	 * CONFIG_LINK_ATTACH_TIMEOUT_TN_S to come back (see link_check()). While
+	 * the link is usable, send a freshly rendered CONFIG_TEST_TEMPLATE payload
+	 * every CONFIG_TEST_INTERVAL seconds; "udp send <text>" remains available
+	 * for manual messages.
 	 */
 	printk("Sending every %d s. Manual send still available: udp send <text>\n",
 	       CONFIG_TEST_INTERVAL);
 
 	for (;;) {
-		enum svc_net want = link_choose();
-
-		if (want == SVC_NONE) {
-			if (app_phase != PHASE_NO_SERVICE) {
-				(void)link_switch(SVC_NONE);
-			}
-			k_sleep(K_SECONDS(1));
-			continue;
+		if (ntn_period_over()) {
+			printk("Satellite period over; testing cellular\n");
+			detach_link();
+			link_mode = SVC_TN;
 		}
 
-		if (want != link_net) {
-			int err = link_switch(want);
+		if (link_net == SVC_NONE) {
+			int64_t deadline = (link_mode == SVC_TN) ?
+				k_uptime_get() +
+					(int64_t)CONFIG_LINK_ATTACH_TIMEOUT_TN_S * 1000 :
+				ntn_until;
 
-			if (err == LINK_ATTACH_PREEMPTED) {
-				continue;
-			}
-			if (err) {
-				/* Back off before retrying; a pin change (or the
-				 * cellular fallback) cuts the wait short.
-				 */
-				for (int s = 0; s < LINK_RETRY_DELAY_S &&
-						link_choose() == want; s++) {
-					k_sleep(K_SECONDS(1));
+			if (attach_link(link_mode, deadline) != 0) {
+				if (link_mode == SVC_TN) {
+					printk("Cellular not available\n");
+					start_ntn_period();
+				} else {
+					for (int s = 0; s < LINK_RETRY_DELAY_S &&
+							!ntn_period_over(); s++) {
+						k_sleep(K_SECONDS(1));
+					}
 				}
 				continue;
 			}
+		}
+
+		/* Link up but lost (other than by unanswered sends): send nothing
+		 * until it recovers, or until the cellular wait or the satellite
+		 * period ends.
+		 */
+		if (!link_sendable()) {
+			k_sleep(K_SECONDS(1));
+			continue;
 		}
 
 		char payload[256];
@@ -1266,8 +1345,12 @@ int main(void)
 		total_cycles++;
 		if (len < 0) {
 			printk("Payload does not fit buffer; check CONFIG_TEST_TEMPLATE\n");
-		} else {
-			udp_send_and_recv(udp_fd, payload, len);
+		} else if (udp_send_and_recv(udp_fd, payload, len)) {
+			fail_sends = 0;
+		} else if (CONFIG_LINK_FAIL_SENDS > 0) {
+			fail_sends++;
+			printk("%s: %u of %d consecutive sends without reply\n",
+			       svc_name[link_net], fail_sends, CONFIG_LINK_FAIL_SENDS);
 		}
 		log_tally();
 
@@ -1284,10 +1367,11 @@ int main(void)
 			}
 		}
 
-		/* Sleep in 1 s steps so a control-pin change takes effect promptly
-		 * instead of after a full send interval.
+		/* Sleep in 1 s steps so a lost link or the end of the satellite
+		 * period is noticed promptly instead of after a full send interval.
 		 */
-		for (int s = 0; s < CONFIG_TEST_INTERVAL && link_choose() == link_net; s++) {
+		for (int s = 0; s < CONFIG_TEST_INTERVAL && link_sendable() &&
+				!ntn_period_over(); s++) {
 			k_sleep(K_SECONDS(1));
 		}
 	}

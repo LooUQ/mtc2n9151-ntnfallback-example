@@ -93,7 +93,7 @@ choice LINK_TN_MODE
 	default LINK_TN_MODE_LTEM
 	help
 	  System mode written with AT%XSYSTEMMODE before each cellular attach.
-	  Cellular is used whenever its control pin (P0.21) is floating.
+	  Cellular is always tried first; satellite is the fallback.
 
 config LINK_TN_MODE_LTEM
 	bool "LTE-M"
@@ -116,24 +116,31 @@ config LINK_ATTACH_TIMEOUT_TN_S
 	int "Cellular attach timeout (s)"
 	default 300
 	help
-	  Abandon a cellular attach that has not registered after this long,
-	  and fall back to satellite if its control pin allows it.
+	  How long each cellular test waits to connect, and how long a lost
+	  cellular connection is given to come back. Either way, if cellular is
+	  not connected by then, the device switches to satellite. Grounding the
+	  cellular control pin (P0.21) makes cellular fail, but only after this
+	  full wait.
 
-config LINK_ATTACH_TIMEOUT_NTN_S
-	int "Satellite attach timeout (s), 0 = wait indefinitely"
-	default 0
+config LINK_FAIL_SENDS
+	int "Consecutive sends without reply before the link counts as lost (0 = off)"
+	default 2
 	help
-	  Abandon a satellite attach that has not registered after this long,
-	  then retry. 0 waits until registration or a control-pin change.
+	  A periodic send cycle fails when the send fails or no reply arrives
+	  within UDP_RECV_TIMEOUT_S. After this many consecutive failures the
+	  live link counts as lost, even though the modem is still registered:
+	  lost cellular then gets LINK_ATTACH_TIMEOUT_TN_S to recover; lost
+	  satellite is only reported. Sends continue while lost this way, and
+	  the first reply restores the link.
 
 config LINK_TN_PROBE_INTERVAL_S
-	int "Satellite dwell (s) before retrying cellular after a failed attach"
+	int "Satellite period (s) between cellular tests"
 	default 900
 	help
-	  After a cellular attach fails and the device falls back to satellite,
-	  stay on satellite this long before trying cellular again. Each retry
-	  that fails restarts the interval. Grounding and releasing the cellular
-	  control pin (P0.21) retries cellular immediately.
+	  After a cellular test fails, use satellite for this long (measured
+	  from the switch to satellite, including the satellite attach), then
+	  drop satellite and test cellular again. The satellite attach may take
+	  up to this whole period; there is no separate satellite timeout.
 
 config TEST_NAME
     string "Test name to use in the payload"

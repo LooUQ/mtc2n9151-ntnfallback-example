@@ -1,12 +1,13 @@
 /*
- * Network service control inputs.
+ * Network failure-simulation inputs.
  *
- * Active-low with the internal pull-up: leave the pin floating and the network
- * is available; ground it and that network is forced out of service. Remove a
- * property to leave that network always available.
+ * Active-low with the internal pull-up: leave the pin floating for normal
+ * operation; ground it and that network never counts as connected. The radio
+ * still searches and every timeout runs in full, so the pin simulates an
+ * outage without changing the timing. Remove a property to disable that pin.
  *
- *   P0.21  grounded = cellular (TN) out of service
- *   P0.22  grounded = satellite (NTN) out of service
+ *   P0.21  grounded = cellular (TN) always fails
+ *   P0.22  grounded = satellite (NTN) always fails
  */
 / {
 	zephyr,user {
