@@ -1,3 +1,6 @@
+** BETA Release - Not exhaustively field tested **
+============
+
 The Skylo field-test sample demonstrates how to communicate with TagoIO using TIP protocol from the LooUQ MTC2-N9151 embedded modem.
 
 Requirements
